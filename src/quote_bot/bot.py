@@ -9,6 +9,7 @@ import json
 import logging
 import math
 import os
+import re
 import secrets
 import threading
 from contextlib import asynccontextmanager, nullcontext
@@ -42,7 +43,7 @@ DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_WEBHOOK_PATH = "/telegram/webhook"
 EMOJI_HTTP_CACHE_MAX_ITEMS = 1024
-DEFAULT_FONT_SIZE = 44
+DEFAULT_FONT_SIZE = 40
 MIN_FONT_SIZE = 32
 PADDING = 40
 LINE_SPACING = 10
@@ -175,6 +176,21 @@ def _wrap_text_line(
     if line == "":
         return [""]
 
+    if " " in line and re.search(r"[A-Za-z0-9]", line):
+        return _wrap_text_line_by_words(line, draw, font, max_width, pilmoji_renderer=pilmoji_renderer)
+    return _wrap_text_line_by_chars(line, draw, font, max_width, pilmoji_renderer=pilmoji_renderer)
+
+
+def _wrap_text_line_by_chars(
+    line: str,
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    pilmoji_renderer: Any | None = None,
+) -> list[str]:
+    if line == "":
+        return [""]
+
     wrapped: list[str] = []
     current = ""
     for char in line:
@@ -186,6 +202,57 @@ def _wrap_text_line(
             current = char
 
     wrapped.append(current)
+    return wrapped
+
+
+def _wrap_text_line_by_words(
+    line: str,
+    draw: ImageDraw.ImageDraw,
+    font: ImageFont.ImageFont,
+    max_width: int,
+    pilmoji_renderer: Any | None = None,
+) -> list[str]:
+    tokens = re.findall(r"\S+|\s+", line)
+    wrapped: list[str] = []
+    current = ""
+
+    for token in tokens:
+        if token.isspace():
+            if not current:
+                continue
+            candidate = f"{current}{token}"
+            if _measure_text_width(draw, font, candidate, pilmoji_renderer=pilmoji_renderer) <= max_width:
+                current = candidate
+            else:
+                wrapped.append(current.rstrip())
+                current = ""
+            continue
+
+        candidate = f"{current}{token}"
+        if _measure_text_width(draw, font, candidate, pilmoji_renderer=pilmoji_renderer) <= max_width or not current:
+            current = candidate
+            continue
+
+        wrapped.append(current.rstrip())
+
+        if _measure_text_width(draw, font, token, pilmoji_renderer=pilmoji_renderer) <= max_width:
+            current = token
+            continue
+
+        token_wrapped = _wrap_text_line_by_chars(
+            token,
+            draw,
+            font,
+            max_width,
+            pilmoji_renderer=pilmoji_renderer,
+        )
+        wrapped.extend(token_wrapped[:-1])
+        current = token_wrapped[-1]
+
+    if current:
+        wrapped.append(current.rstrip())
+    if not wrapped:
+        return [""]
     return wrapped
 
 
@@ -235,6 +302,10 @@ def _calculate_canvas_size(text_width: int, text_height: int) -> tuple[int, int]
     ratio_target_height = int(math.ceil(image_width / MAX_WIDTH_TO_HEIGHT_RATIO))
     if ratio_target_height > image_height:
         image_height = ratio_target_height
+
+    # Keep image from becoming too tall: height <= width.
+    if image_height > image_width:
+        image_width = image_height
 
     return image_width, image_height
 

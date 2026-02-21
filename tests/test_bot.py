@@ -3,17 +3,19 @@ import unittest
 from io import BytesIO
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 from quote_bot.bot import (
     _build_webhook_health_path,
     _build_webhook_url,
     _build_inline_photo_result,
     _contains_emoji,
     _load_font,
+    MAX_WIDTH_TO_HEIGHT_RATIO,
     _normalize_run_mode,
     _normalize_webhook_public_base_url,
     _normalize_webhook_path,
     _process_inline_query,
+    _wrap_text_line,
     extract_inline_query,
     extract_text_message,
     render_text_to_png,
@@ -90,7 +92,16 @@ class BotTestCase(unittest.TestCase):
         image_data = render_text_to_png(text)
         with Image.open(BytesIO(image_data)) as image:
             width, height = image.size
-        self.assertLessEqual(width, height * 3)
+        self.assertLessEqual(width, height * MAX_WIDTH_TO_HEIGHT_RATIO)
+        self.assertLessEqual(height, width)
+
+    def test_wrap_text_line_prefers_space_word_wrap_for_english(self) -> None:
+        image = Image.new("RGB", (1, 1), "white")
+        draw = ImageDraw.Draw(image)
+        font = _load_font(32)
+        max_width = draw.textbbox((0, 0), "hello world", font=font)[2]
+        wrapped = _wrap_text_line("hello world test", draw, font, max_width)
+        self.assertEqual(wrapped, ["hello world", "test"])
 
     def test_normalize_run_mode(self) -> None:
         self.assertEqual(_normalize_run_mode("polling"), "polling")
