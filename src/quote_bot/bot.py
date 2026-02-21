@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import secrets
 import threading
@@ -50,6 +51,7 @@ MIN_IMAGE_WIDTH = 240
 MIN_IMAGE_HEIGHT = 120
 MAX_IMAGE_WIDTH = 1600
 MAX_IMAGE_HEIGHT = 4096
+WRAP_WIDTH_SHRINK_FACTOR = 0.85
 DEFAULT_FONT_PATHS = (
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
@@ -191,12 +193,12 @@ def _layout_text(
     text: str,
     draw: ImageDraw.ImageDraw,
     font: ImageFont.ImageFont,
+    max_text_width: int,
     pilmoji_renderer: Any | None = None,
 ) -> tuple[list[str], int, int, int]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
     raw_lines = normalized.split("\n") or [" "]
 
-    max_text_width = MAX_IMAGE_WIDTH - 2 * PADDING
     lines: list[str] = []
     for line in raw_lines:
         lines.extend(_wrap_text_line(line, draw, font, max_text_width, pilmoji_renderer=pilmoji_renderer))
@@ -209,6 +211,32 @@ def _layout_text(
     text_width = max(widths) if widths else 1
     text_height = max(1, len(lines) * line_height - LINE_SPACING)
     return lines, text_width, text_height, line_height
+
+
+def _iter_wrap_width_candidates(max_text_width: int, min_text_width: int) -> list[int]:
+    candidates: list[int] = []
+    current_width = max(max_text_width, min_text_width)
+    while True:
+        candidates.append(current_width)
+        if current_width <= min_text_width:
+            break
+        next_width = max(min_text_width, int(current_width * WRAP_WIDTH_SHRINK_FACTOR))
+        if next_width >= current_width:
+            next_width = current_width - 1
+        current_width = next_width
+    return candidates
+
+
+def _calculate_canvas_size(text_width: int, text_height: int) -> tuple[int, int]:
+    image_width = max(MIN_IMAGE_WIDTH, text_width + 2 * PADDING)
+    image_height = max(MIN_IMAGE_HEIGHT, text_height + 2 * PADDING)
+
+    # Keep image from becoming too wide: width <= height * MAX_WIDTH_TO_HEIGHT_RATIO.
+    ratio_target_height = int(math.ceil(image_width / MAX_WIDTH_TO_HEIGHT_RATIO))
+    if ratio_target_height > image_height:
+        image_height = ratio_target_height
+
+    return image_width, image_height
 
 
 def _draw_text_line(
@@ -241,6 +269,9 @@ def render_text_to_png(text: str) -> bytes:
     use_google_emoji = _contains_emoji(content)
     measure_image = Image.new("RGB", (1, 1), "white")
     measure_draw = ImageDraw.Draw(measure_image)
+    max_text_width = MAX_IMAGE_WIDTH - 2 * PADDING
+    min_text_width = max(1, MIN_IMAGE_WIDTH - 2 * PADDING)
+    wrap_width_candidates = _iter_wrap_width_candidates(max_text_width, min_text_width)
 
     best_lines: list[str] = [" "]
     best_font: ImageFont.ImageFont = _load_font(MIN_FONT_SIZE)
@@ -251,23 +282,47 @@ def render_text_to_png(text: str) -> bytes:
     with _open_google_pilmoji(measure_image, measure_draw) if use_google_emoji else nullcontext(None) as measure_pilmoji:
         for font_size in range(DEFAULT_FONT_SIZE, MIN_FONT_SIZE - 1, -4):
             font = _load_font(font_size)
-            lines, text_width, text_height, line_height = _layout_text(
-                content,
-                measure_draw,
-                font,
-                pilmoji_renderer=measure_pilmoji,
-            )
+            best_layout_for_font: tuple[list[str], int, int, int] | None = None
+            best_layout_score = -1.0
+            lowest_overflow_layout: tuple[list[str], int, int, int] | None = None
+            lowest_overflow = math.inf
 
-            candidate_width = max(MIN_IMAGE_WIDTH, text_width + 2 * PADDING)
-            candidate_height = max(MIN_IMAGE_HEIGHT, text_height + 2 * PADDING)
+            for wrap_width in wrap_width_candidates:
+                lines, text_width, text_height, line_height = _layout_text(
+                    content,
+                    measure_draw,
+                    font,
+                    max_text_width=wrap_width,
+                    pilmoji_renderer=measure_pilmoji,
+                )
+                candidate_width, candidate_height = _calculate_canvas_size(text_width, text_height)
 
-            best_lines = lines
-            best_font = font
-            best_line_height = line_height
-            image_width = candidate_width
-            image_height = candidate_height
-            if candidate_width <= MAX_IMAGE_WIDTH and candidate_height <= MAX_IMAGE_HEIGHT:
+                if candidate_width <= MAX_IMAGE_WIDTH and candidate_height <= MAX_IMAGE_HEIGHT:
+                    # Within the same font size, prefer layouts that use more canvas area.
+                    layout_score = min(candidate_width / MAX_IMAGE_WIDTH, candidate_height / MAX_IMAGE_HEIGHT)
+                    if layout_score > best_layout_score:
+                        best_layout_score = layout_score
+                        best_layout_for_font = (lines, line_height, candidate_width, candidate_height)
+                else:
+                    overflow = max(
+                        0,
+                        candidate_width - MAX_IMAGE_WIDTH,
+                        candidate_height - MAX_IMAGE_HEIGHT,
+                    )
+                    if overflow < lowest_overflow:
+                        lowest_overflow = overflow
+                        lowest_overflow_layout = (lines, line_height, candidate_width, candidate_height)
+                    # Narrower wraps only increase text height, so stop early once height overflows.
+                    if candidate_height > MAX_IMAGE_HEIGHT:
+                        break
+
+            if best_layout_for_font is not None:
+                best_lines, best_line_height, image_width, image_height = best_layout_for_font
+                best_font = font
                 break
+            if lowest_overflow_layout is not None:
+                best_lines, best_line_height, image_width, image_height = lowest_overflow_layout
+                best_font = font
 
         if image_height > MAX_IMAGE_HEIGHT:
             max_lines = max(1, (MAX_IMAGE_HEIGHT - 2 * PADDING + LINE_SPACING) // best_line_height)
@@ -277,13 +332,11 @@ def render_text_to_png(text: str) -> bytes:
                 _measure_text_width(measure_draw, best_font, line, pilmoji_renderer=measure_pilmoji)
                 for line in best_lines
             )
-            image_width = min(MAX_IMAGE_WIDTH, max(MIN_IMAGE_WIDTH, truncated_width + 2 * PADDING))
-            image_height = MAX_IMAGE_HEIGHT
+            truncated_text_height = max(1, len(best_lines) * best_line_height - LINE_SPACING)
+            image_width, image_height = _calculate_canvas_size(truncated_width, truncated_text_height)
 
-        # Keep image from becoming too wide: width <= height * MAX_WIDTH_TO_HEIGHT_RATIO.
-        ratio_target_height = int((image_width + MAX_WIDTH_TO_HEIGHT_RATIO - 1) // MAX_WIDTH_TO_HEIGHT_RATIO)
-        if ratio_target_height > image_height:
-            image_height = min(MAX_IMAGE_HEIGHT, max(image_height, ratio_target_height))
+        image_width = min(MAX_IMAGE_WIDTH, max(MIN_IMAGE_WIDTH, image_width))
+        image_height = min(MAX_IMAGE_HEIGHT, max(MIN_IMAGE_HEIGHT, image_height))
 
     image = Image.new("RGB", (image_width, image_height), "white")
     draw = ImageDraw.Draw(image)
