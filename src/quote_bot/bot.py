@@ -234,8 +234,8 @@ def render_text_to_png(text: str) -> bytes:
             image_width = min(MAX_IMAGE_WIDTH, max(MIN_IMAGE_WIDTH, truncated_width + 2 * PADDING))
             image_height = MAX_IMAGE_HEIGHT
 
-        # Keep image from becoming too wide: width <= height * 3.
-        ratio_target_height = (image_width + MAX_WIDTH_TO_HEIGHT_RATIO - 1) // MAX_WIDTH_TO_HEIGHT_RATIO
+        # Keep image from becoming too wide: width <= height * MAX_WIDTH_TO_HEIGHT_RATIO.
+        ratio_target_height = int((image_width + MAX_WIDTH_TO_HEIGHT_RATIO - 1) // MAX_WIDTH_TO_HEIGHT_RATIO)
         if ratio_target_height > image_height:
             image_height = min(MAX_IMAGE_HEIGHT, max(image_height, ratio_target_height))
 
