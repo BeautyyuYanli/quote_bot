@@ -5,11 +5,16 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 from quote_bot.bot import (
+    FIXED_WIDTH_REFERENCE_FONT_SIZE,
+    FIXED_WIDTH_REFERENCE_TEXT,
+    PADDING,
     _build_webhook_health_path,
     _build_webhook_url,
+    _fixed_image_width,
     _build_inline_photo_result,
     _contains_emoji,
     _load_font,
+    _measure_text_width,
     MAX_WIDTH_TO_HEIGHT_RATIO,
     _normalize_run_mode,
     _normalize_webhook_public_base_url,
@@ -102,6 +107,39 @@ class BotTestCase(unittest.TestCase):
         max_width = draw.textbbox((0, 0), "hello world", font=font)[2]
         wrapped = _wrap_text_line("hello world test", draw, font, max_width)
         self.assertEqual(wrapped, ["hello world", "test"])
+
+    def test_render_text_to_png_avoids_premature_wrap_for_short_english(self) -> None:
+        text = "this is a sample sentence with english words and spaces"
+        image_data = render_text_to_png(text)
+        with Image.open(BytesIO(image_data)) as image:
+            width, height = image.size
+        self.assertGreater(width, height)
+
+    def test_render_text_to_png_uses_fixed_width(self) -> None:
+        texts = [
+            "hello",
+            "this is a sample sentence with english words and spaces",
+            "x" * 500,
+        ]
+        widths: list[int] = []
+        for text in texts:
+            with Image.open(BytesIO(render_text_to_png(text))) as image:
+                widths.append(image.size[0])
+        self.assertTrue(all(width == widths[0] for width in widths))
+        self.assertEqual(widths[0], _fixed_image_width())
+
+    def test_render_text_to_png_fills_half_height_for_few_lines(self) -> None:
+        text = "hello"
+        with Image.open(BytesIO(render_text_to_png(text))) as image:
+            width, height = image.size
+        self.assertGreaterEqual(height, (width + 1) // 2)
+
+    def test_fixed_width_can_hold_15_chinese_chars_at_font_44(self) -> None:
+        image = Image.new("RGB", (1, 1), "white")
+        draw = ImageDraw.Draw(image)
+        font = _load_font(FIXED_WIDTH_REFERENCE_FONT_SIZE)
+        text_width = _measure_text_width(draw, font, FIXED_WIDTH_REFERENCE_TEXT)
+        self.assertGreaterEqual(_fixed_image_width() - 2 * PADDING, text_width)
 
     def test_normalize_run_mode(self) -> None:
         self.assertEqual(_normalize_run_mode("polling"), "polling")
