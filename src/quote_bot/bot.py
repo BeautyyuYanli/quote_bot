@@ -851,6 +851,13 @@ def _build_webhook_url(public_base_url: str, webhook_path: str) -> str:
     return f"{_normalize_webhook_public_base_url(public_base_url)}{_normalize_webhook_path(webhook_path)}"
 
 
+def _build_webhook_health_path(webhook_path: str) -> str:
+    normalized = _normalize_webhook_path(webhook_path).rstrip("/")
+    if normalized == "":
+        return "/healthz"
+    return f"{normalized}/healthz"
+
+
 async def _ensure_polling_mode(api: TelegramApi, retry_delay: float) -> None:
     delay = max(0.1, retry_delay)
     while True:
@@ -916,6 +923,7 @@ def create_webhook_app(
         worker_concurrency=worker_concurrency,
     )
     normalized_webhook_path = _normalize_webhook_path(webhook_path)
+    webhook_health_path = _build_webhook_health_path(normalized_webhook_path)
     webhook_url = _build_webhook_url(webhook_public_base_url, normalized_webhook_path)
     expected_secret = secrets.token_urlsafe(32)
 
@@ -957,7 +965,7 @@ def create_webhook_app(
         )
         return {"ok": True}
 
-    @app.get("/healthz")
+    @app.get(webhook_health_path)
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 

@@ -47,6 +47,7 @@ pdm run quote-bot
 
 webhook 模式启动时会自动生成 secret token，并自动调用 Telegram `setWebhook`。
 polling 模式启动时会自动调用 Telegram `deleteWebhook`，无需手工切换。
+`docker-compose` 的健康检查由 `python -m quote_bot.healthcheck` 执行，在 webhook 模式下会从容器内通过公网访问 `WEBHOOK_PUBLIC_BASE_URL + WEBHOOK_PATH + /healthz`。
 
 ## 启用 Inline Mode
 

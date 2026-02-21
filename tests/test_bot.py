@@ -3,6 +3,7 @@ from io import BytesIO
 
 from PIL import Image
 from quote_bot.bot import (
+    _build_webhook_health_path,
     _build_webhook_url,
     _build_inline_photo_result,
     _contains_emoji,
@@ -103,6 +104,11 @@ class BotTestCase(unittest.TestCase):
             _build_webhook_url("https://bot.example.com/", "/telegram/webhook"),
             "https://bot.example.com/telegram/webhook",
         )
+
+    def test_build_webhook_health_path(self) -> None:
+        self.assertEqual(_build_webhook_health_path("/telegram/webhook"), "/telegram/webhook/healthz")
+        self.assertEqual(_build_webhook_health_path("telegram/webhook/"), "/telegram/webhook/healthz")
+        self.assertEqual(_build_webhook_health_path("/"), "/healthz")
 
 
 if __name__ == "__main__":

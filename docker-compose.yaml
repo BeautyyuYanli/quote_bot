@@ -6,6 +6,12 @@ services:
     image: quote-bot:latest
     container_name: quote-bot
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-m", "quote_bot.healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 25s
     ports:
       - "${PORT:-8080}:8080"
     environment:
