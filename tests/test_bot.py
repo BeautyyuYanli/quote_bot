@@ -3,8 +3,12 @@ from io import BytesIO
 
 from PIL import Image
 from quote_bot.bot import (
+    _build_webhook_url,
     _build_inline_photo_result,
     _contains_emoji,
+    _normalize_run_mode,
+    _normalize_webhook_public_base_url,
+    _normalize_webhook_path,
     extract_inline_query,
     extract_text_message,
     render_text_to_png,
@@ -75,6 +79,30 @@ class BotTestCase(unittest.TestCase):
         with Image.open(BytesIO(image_data)) as image:
             width, height = image.size
         self.assertLessEqual(width, height * 3)
+
+    def test_normalize_run_mode(self) -> None:
+        self.assertEqual(_normalize_run_mode("polling"), "polling")
+        self.assertEqual(_normalize_run_mode(" WEBHOOK "), "webhook")
+        with self.assertRaises(SystemExit):
+            _normalize_run_mode("invalid")
+
+    def test_normalize_webhook_path(self) -> None:
+        self.assertEqual(_normalize_webhook_path("/a/b"), "/a/b")
+        self.assertEqual(_normalize_webhook_path("a/b"), "/a/b")
+        self.assertEqual(_normalize_webhook_path(""), "/telegram/webhook")
+
+    def test_normalize_webhook_public_base_url(self) -> None:
+        self.assertEqual(_normalize_webhook_public_base_url("https://bot.example.com/"), "https://bot.example.com")
+        with self.assertRaises(SystemExit):
+            _normalize_webhook_public_base_url("")
+        with self.assertRaises(SystemExit):
+            _normalize_webhook_public_base_url("bot.example.com")
+
+    def test_build_webhook_url(self) -> None:
+        self.assertEqual(
+            _build_webhook_url("https://bot.example.com/", "/telegram/webhook"),
+            "https://bot.example.com/telegram/webhook",
+        )
 
 
 if __name__ == "__main__":

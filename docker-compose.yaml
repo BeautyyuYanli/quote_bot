@@ -6,12 +6,17 @@ services:
     image: quote-bot:latest
     container_name: quote-bot
     restart: unless-stopped
+    ports:
+      - "${PORT:-8080}:8080"
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Please set TELEGRAM_BOT_TOKEN in .env or shell}
+      BOT_MODE: ${BOT_MODE:-polling}
       POLL_TIMEOUT: ${POLL_TIMEOUT:-30}
       RETRY_DELAY_SECONDS: ${RETRY_DELAY_SECONDS:-3}
       INLINE_CACHE_TIME: ${INLINE_CACHE_TIME:-60}
-      INLINE_CACHE_CHAT_ID: ${INLINE_CACHE_CHAT_ID:?}
+      INLINE_CACHE_CHAT_ID: ${INLINE_CACHE_CHAT_ID:-}
       INLINE_DEBOUNCE_SECONDS: ${INLINE_DEBOUNCE_SECONDS:-1.5}
       WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-32}
+      WEBHOOK_PUBLIC_BASE_URL: ${WEBHOOK_PUBLIC_BASE_URL:-}
+      WEBHOOK_PATH: ${WEBHOOK_PATH:-/telegram/webhook}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}

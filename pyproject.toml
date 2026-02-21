@@ -5,7 +5,7 @@ description = "Default template for PDM package"
 authors = [
     {name = "盐粒 Yanli", email = "mail@yanli.one"},
 ]
-dependencies = ["httpx>=0.28.1", "Pillow>=11.1.0", "pilmoji>=2.0.0", "emoji>=2.10.0"]
+dependencies = ["httpx>=0.28.1", "Pillow>=11.1.0", "pilmoji>=2.0.0", "emoji>=2.10.0", "fastapi>=0.116.0", "uvicorn>=0.35.0", "uvloop>=0.22.0; platform_system != \"Windows\""]
 requires-python = ">=3.13"
 readme = "README.md"
 license = {text = "MIT"}

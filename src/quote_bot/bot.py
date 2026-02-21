@@ -7,11 +7,15 @@ import io
 import json
 import logging
 import os
-from contextlib import nullcontext
+import secrets
+from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 import emoji
 import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException, Request
 from PIL import Image, ImageDraw, ImageFont
 
 try:
@@ -22,11 +26,18 @@ except Exception:
     GoogleEmojiSource = None
 
 API_ROOT = "https://api.telegram.org"
+DEFAULT_RUN_MODE = "polling"
+RUN_MODE_POLLING = "polling"
+RUN_MODE_WEBHOOK = "webhook"
+SUPPORTED_RUN_MODES = (RUN_MODE_POLLING, RUN_MODE_WEBHOOK)
 DEFAULT_POLL_TIMEOUT = 30
 DEFAULT_RETRY_DELAY = 3.0
 DEFAULT_INLINE_CACHE_TIME = 60
 DEFAULT_INLINE_DEBOUNCE_SECONDS = 0.8
 DEFAULT_WORKER_CONCURRENCY = 4
+DEFAULT_BIND_HOST = "0.0.0.0"
+DEFAULT_PORT = 8080
+DEFAULT_WEBHOOK_PATH = "/telegram/webhook"
 DEFAULT_FONT_SIZE = 44
 MIN_FONT_SIZE = 16
 PADDING = 40
@@ -362,6 +373,89 @@ class TelegramApi:
         if not payload.get("ok"):
             raise RuntimeError(f"Telegram answerInlineQuery failed: {payload}")
 
+    async def set_webhook(
+        self,
+        *,
+        url: str,
+        secret_token: str,
+        allowed_updates: list[str] | None = None,
+    ) -> None:
+        payload: dict[str, str] = {
+            "url": url,
+            "secret_token": secret_token,
+        }
+        if allowed_updates is not None:
+            payload["allowed_updates"] = json.dumps(allowed_updates)
+
+        response = await self._client.post(
+            f"{self._base_url}/setWebhook",
+            data=payload,
+            timeout=20,
+        )
+        response.raise_for_status()
+
+        body = response.json()
+        if not body.get("ok"):
+            raise RuntimeError(f"Telegram setWebhook failed: {body}")
+
+    async def delete_webhook(self, *, drop_pending_updates: bool = False) -> None:
+        response = await self._client.post(
+            f"{self._base_url}/deleteWebhook",
+            data={
+                "drop_pending_updates": "true" if drop_pending_updates else "false",
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+
+        body = response.json()
+        if not body.get("ok"):
+            raise RuntimeError(f"Telegram deleteWebhook failed: {body}")
+
+
+@dataclass
+class RuntimeState:
+    inline_cache_time: int
+    inline_cache_chat_id: int | None
+    inline_debounce_seconds: float
+    worker_concurrency: int
+    inline_file_cache: dict[str, str] = field(default_factory=dict)
+    latest_inline_queries: dict[int, tuple[str, str]] = field(default_factory=dict)
+    inline_debounce_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
+    inline_processing_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
+    processing_semaphore: asyncio.Semaphore = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.processing_semaphore = asyncio.Semaphore(max(1, self.worker_concurrency))
+
+
+def _build_runtime_state(
+    inline_cache_time: int,
+    inline_cache_chat_id: int | None,
+    inline_debounce_seconds: float,
+    worker_concurrency: int,
+) -> RuntimeState:
+    return RuntimeState(
+        inline_cache_time=max(0, inline_cache_time),
+        inline_cache_chat_id=inline_cache_chat_id,
+        inline_debounce_seconds=max(0.0, inline_debounce_seconds),
+        worker_concurrency=max(1, worker_concurrency),
+    )
+
+
+async def _cancel_runtime_tasks(runtime: RuntimeState) -> None:
+    tasks = [*runtime.inline_debounce_tasks.values(), *runtime.inline_processing_tasks.values()]
+    for task in tasks:
+        if not task.done():
+            task.cancel()
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    runtime.inline_debounce_tasks.clear()
+    runtime.inline_processing_tasks.clear()
+    runtime.latest_inline_queries.clear()
+
 
 def _extract_photo_file_id(message: dict[str, Any]) -> str:
     photos = message.get("photo")
@@ -606,14 +700,7 @@ async def _dispatch_update(
     *,
     api: TelegramApi,
     update: dict[str, Any],
-    inline_cache_time: int,
-    inline_cache_chat_id: int | None,
-    inline_debounce_seconds: float,
-    inline_file_cache: dict[str, str],
-    latest_inline_queries: dict[int, tuple[str, str]],
-    inline_debounce_tasks: dict[int, asyncio.Task[None]],
-    inline_processing_tasks: dict[int, asyncio.Task[None]],
-    processing_semaphore: asyncio.Semaphore,
+    runtime: RuntimeState,
 ) -> None:
     try:
         update_id = update.get("update_id")
@@ -626,7 +713,7 @@ async def _dispatch_update(
                 chat_id=chat_id,
                 text=text,
                 update_id=update_id if isinstance(update_id, int) else None,
-                processing_semaphore=processing_semaphore,
+                processing_semaphore=runtime.processing_semaphore,
             )
             return
 
@@ -639,15 +726,15 @@ async def _dispatch_update(
             inline_query_id=inline_query_id,
             from_user_id=from_user_id,
             query_text=query_text,
-            inline_debounce_seconds=max(0.0, inline_debounce_seconds),
-            latest_inline_queries=latest_inline_queries,
-            inline_debounce_tasks=inline_debounce_tasks,
-            inline_processing_tasks=inline_processing_tasks,
+            inline_debounce_seconds=runtime.inline_debounce_seconds,
+            latest_inline_queries=runtime.latest_inline_queries,
+            inline_debounce_tasks=runtime.inline_debounce_tasks,
+            inline_processing_tasks=runtime.inline_processing_tasks,
             api=api,
-            inline_file_cache=inline_file_cache,
-            inline_cache_time=inline_cache_time,
-            inline_cache_chat_id=inline_cache_chat_id,
-            processing_semaphore=processing_semaphore,
+            inline_file_cache=runtime.inline_file_cache,
+            inline_cache_time=runtime.inline_cache_time,
+            inline_cache_chat_id=runtime.inline_cache_chat_id,
+            processing_semaphore=runtime.processing_semaphore,
         )
     except asyncio.CancelledError:
         return
@@ -660,14 +747,7 @@ async def _poll_updates_loop(
     *,
     poll_timeout: int,
     retry_delay: float,
-    inline_cache_time: int,
-    inline_cache_chat_id: int | None,
-    inline_debounce_seconds: float,
-    inline_file_cache: dict[str, str],
-    latest_inline_queries: dict[int, tuple[str, str]],
-    inline_debounce_tasks: dict[int, asyncio.Task[None]],
-    inline_processing_tasks: dict[int, asyncio.Task[None]],
-    processing_semaphore: asyncio.Semaphore,
+    runtime: RuntimeState,
 ) -> None:
     offset = 0
     while True:
@@ -686,16 +766,39 @@ async def _poll_updates_loop(
                 _dispatch_update(
                     api=api,
                     update=update,
-                    inline_cache_time=inline_cache_time,
-                    inline_cache_chat_id=inline_cache_chat_id,
-                    inline_debounce_seconds=inline_debounce_seconds,
-                    inline_file_cache=inline_file_cache,
-                    latest_inline_queries=latest_inline_queries,
-                    inline_debounce_tasks=inline_debounce_tasks,
-                    inline_processing_tasks=inline_processing_tasks,
-                    processing_semaphore=processing_semaphore,
+                    runtime=runtime,
                 )
             )
+
+
+async def run_polling(
+    token: str,
+    poll_timeout: int,
+    retry_delay: float,
+    inline_cache_time: int,
+    inline_cache_chat_id: int | None,
+    inline_debounce_seconds: float,
+    worker_concurrency: int,
+) -> None:
+    runtime = _build_runtime_state(
+        inline_cache_time=inline_cache_time,
+        inline_cache_chat_id=inline_cache_chat_id,
+        inline_debounce_seconds=inline_debounce_seconds,
+        worker_concurrency=worker_concurrency,
+    )
+
+    async with httpx.AsyncClient() as client:
+        api = TelegramApi(token=token, client=client)
+        try:
+            await _ensure_polling_mode(api=api, retry_delay=retry_delay)
+            await _poll_updates_loop(
+                api=api,
+                poll_timeout=max(1, poll_timeout),
+                retry_delay=max(0.1, retry_delay),
+                runtime=runtime,
+            )
+        finally:
+            await _cancel_runtime_tasks(runtime)
 
 
 async def run(
@@ -707,27 +810,192 @@ async def run(
     inline_debounce_seconds: float,
     worker_concurrency: int,
 ) -> None:
-    inline_file_cache: dict[str, str] = {}
-    latest_inline_queries: dict[int, tuple[str, str]] = {}
-    inline_debounce_tasks: dict[int, asyncio.Task[None]] = {}
-    inline_processing_tasks: dict[int, asyncio.Task[None]] = {}
-    processing_semaphore = asyncio.Semaphore(max(1, worker_concurrency))
+    await run_polling(
+        token=token,
+        poll_timeout=poll_timeout,
+        retry_delay=retry_delay,
+        inline_cache_time=inline_cache_time,
+        inline_cache_chat_id=inline_cache_chat_id,
+        inline_debounce_seconds=inline_debounce_seconds,
+        worker_concurrency=worker_concurrency,
+    )
 
-    async with httpx.AsyncClient() as client:
-        api = TelegramApi(token=token, client=client)
-        await _poll_updates_loop(
-            api=api,
-            poll_timeout=max(1, poll_timeout),
-            retry_delay=max(0.1, retry_delay),
-            inline_cache_time=max(0, inline_cache_time),
-            inline_cache_chat_id=inline_cache_chat_id,
-            inline_debounce_seconds=max(0.0, inline_debounce_seconds),
-            inline_file_cache=inline_file_cache,
-            latest_inline_queries=latest_inline_queries,
-            inline_debounce_tasks=inline_debounce_tasks,
-            inline_processing_tasks=inline_processing_tasks,
-            processing_semaphore=processing_semaphore,
+
+def _normalize_run_mode(value: str) -> str:
+    mode = (value or "").strip().lower()
+    if mode not in SUPPORTED_RUN_MODES:
+        supported = ", ".join(SUPPORTED_RUN_MODES)
+        raise SystemExit(f"Invalid run mode: {value!r}. Supported modes: {supported}.")
+    return mode
+
+
+def _normalize_webhook_path(value: str) -> str:
+    path = (value or "").strip()
+    if not path:
+        return DEFAULT_WEBHOOK_PATH
+    if not path.startswith("/"):
+        return f"/{path}"
+    return path
+
+
+def _normalize_webhook_public_base_url(value: str) -> str:
+    base_url = (value or "").strip().rstrip("/")
+    if not base_url:
+        raise SystemExit("Missing webhook public URL. Set WEBHOOK_PUBLIC_BASE_URL or pass --webhook-public-base-url.")
+    if not (base_url.startswith("https://") or base_url.startswith("http://")):
+        raise SystemExit("Invalid webhook public URL. Must start with http:// or https://.")
+    return base_url
+
+
+def _build_webhook_url(public_base_url: str, webhook_path: str) -> str:
+    return f"{_normalize_webhook_public_base_url(public_base_url)}{_normalize_webhook_path(webhook_path)}"
+
+
+async def _ensure_polling_mode(api: TelegramApi, retry_delay: float) -> None:
+    delay = max(0.1, retry_delay)
+    while True:
+        try:
+            await api.delete_webhook(drop_pending_updates=False)
+            logging.info("Telegram webhook disabled, polling mode ready.")
+            return
+        except Exception:
+            logging.exception("Failed to disable webhook, retrying in %.1fs", delay)
+            await asyncio.sleep(delay)
+
+
+async def _ensure_webhook_mode(
+    api: TelegramApi,
+    *,
+    webhook_url: str,
+    secret_token: str,
+    retry_delay: float,
+) -> None:
+    delay = max(0.1, retry_delay)
+    while True:
+        try:
+            await api.set_webhook(
+                url=webhook_url,
+                secret_token=secret_token,
+                allowed_updates=["message", "inline_query"],
+            )
+            logging.info("Telegram webhook set to %s", webhook_url)
+            return
+        except Exception:
+            logging.exception("Failed to set webhook, retrying in %.1fs", delay)
+            await asyncio.sleep(delay)
+
+
+def _setup_uvloop_for_polling() -> None:
+    try:
+        import uvloop  # type: ignore
+    except Exception:
+        logging.info("uvloop unavailable, falling back to default asyncio loop.")
+        return
+
+    try:
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        logging.exception("Failed to enable uvloop, using default asyncio loop.")
+
+
+def create_webhook_app(
+    *,
+    token: str,
+    inline_cache_time: int,
+    inline_cache_chat_id: int | None,
+    inline_debounce_seconds: float,
+    worker_concurrency: int,
+    retry_delay: float,
+    webhook_public_base_url: str,
+    webhook_path: str,
+) -> FastAPI:
+    runtime = _build_runtime_state(
+        inline_cache_time=inline_cache_time,
+        inline_cache_chat_id=inline_cache_chat_id,
+        inline_debounce_seconds=inline_debounce_seconds,
+        worker_concurrency=worker_concurrency,
+    )
+    normalized_webhook_path = _normalize_webhook_path(webhook_path)
+    webhook_url = _build_webhook_url(webhook_public_base_url, normalized_webhook_path)
+    expected_secret = secrets.token_urlsafe(32)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        async with httpx.AsyncClient() as client:
+            api = TelegramApi(token=token, client=client)
+            await _ensure_webhook_mode(
+                api=api,
+                webhook_url=webhook_url,
+                secret_token=expected_secret,
+                retry_delay=retry_delay,
+            )
+            yield {"api": api, "runtime": runtime}
+            await _cancel_runtime_tasks(runtime)
+
+    app = FastAPI(lifespan=lifespan)
+
+    @app.post(normalized_webhook_path)
+    async def telegram_webhook(request: Request) -> dict[str, bool]:
+        got_secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if got_secret != expected_secret:
+            raise HTTPException(status_code=403, detail="Forbidden")
+
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Invalid Telegram update payload")
+
+        asyncio.create_task(
+            _dispatch_update(
+                api=request.state.api,
+                update=payload,
+                runtime=request.state.runtime,
+            )
         )
+        return {"ok": True}
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, str]:
+        return {"status": "ok"}
+
+    return app
+
+
+def run_webhook(
+    *,
+    token: str,
+    inline_cache_time: int,
+    inline_cache_chat_id: int | None,
+    inline_debounce_seconds: float,
+    worker_concurrency: int,
+    retry_delay: float,
+    port: int,
+    webhook_public_base_url: str,
+    webhook_path: str,
+    log_level: str,
+) -> None:
+    app = create_webhook_app(
+        token=token,
+        inline_cache_time=inline_cache_time,
+        inline_cache_chat_id=inline_cache_chat_id,
+        inline_debounce_seconds=inline_debounce_seconds,
+        worker_concurrency=worker_concurrency,
+        retry_delay=max(0.1, retry_delay),
+        webhook_public_base_url=webhook_public_base_url,
+        webhook_path=webhook_path,
+    )
+
+    config = uvicorn.Config(
+        app=app,
+        host=DEFAULT_BIND_HOST,
+        port=max(1, int(port)),
+        log_level=str(log_level).lower(),
+    )
+    server = uvicorn.Server(config)
+    server.run()
 
 
 def _env_int(name: str, default: int) -> int:
@@ -756,6 +1024,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         description="Telegram bot that turns received text into black text on white image."
     )
     parser.add_argument("--token", default=os.getenv("TELEGRAM_BOT_TOKEN"), help="Telegram bot token")
+    parser.add_argument(
+        "--mode",
+        default=os.getenv("BOT_MODE", DEFAULT_RUN_MODE),
+        help=f"Run mode: {RUN_MODE_POLLING} (default) or {RUN_MODE_WEBHOOK}",
+    )
     parser.add_argument(
         "--timeout",
         type=int,
@@ -797,6 +1070,22 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         default=os.getenv("LOG_LEVEL", "INFO"),
         help="Python logging level (DEBUG, INFO, WARNING, ERROR)",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=_env_int("PORT", DEFAULT_PORT),
+        help=f"Bind port (default: {DEFAULT_PORT})",
+    )
+    parser.add_argument(
+        "--webhook-path",
+        default=os.getenv("WEBHOOK_PATH", DEFAULT_WEBHOOK_PATH),
+        help=f"Webhook route path (default: {DEFAULT_WEBHOOK_PATH})",
+    )
+    parser.add_argument(
+        "--webhook-public-base-url",
+        default=os.getenv("WEBHOOK_PUBLIC_BASE_URL", ""),
+        help="Public base URL for Telegram webhook registration (e.g., https://bot.example.com).",
+    )
     return parser.parse_args(argv)
 
 
@@ -810,18 +1099,35 @@ def main(argv: Sequence[str] | None = None) -> None:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
+    mode = _normalize_run_mode(str(args.mode))
+
     try:
-        asyncio.run(
-            run(
+        if mode == RUN_MODE_WEBHOOK:
+            run_webhook(
                 token=args.token,
-                poll_timeout=args.timeout,
-                retry_delay=args.retry_delay,
                 inline_cache_time=max(0, int(args.inline_cache_time)),
                 inline_cache_chat_id=args.inline_cache_chat_id,
                 inline_debounce_seconds=max(0.0, float(args.inline_debounce_seconds)),
                 worker_concurrency=max(1, int(args.worker_concurrency)),
+                retry_delay=max(0.1, float(args.retry_delay)),
+                port=max(1, int(args.port)),
+                webhook_public_base_url=str(args.webhook_public_base_url),
+                webhook_path=_normalize_webhook_path(str(args.webhook_path)),
+                log_level=str(args.log_level),
             )
-        )
+        else:
+            _setup_uvloop_for_polling()
+            asyncio.run(
+                run_polling(
+                    token=args.token,
+                    poll_timeout=args.timeout,
+                    retry_delay=args.retry_delay,
+                    inline_cache_time=max(0, int(args.inline_cache_time)),
+                    inline_cache_chat_id=args.inline_cache_chat_id,
+                    inline_debounce_seconds=max(0.0, float(args.inline_debounce_seconds)),
+                    worker_concurrency=max(1, int(args.worker_concurrency)),
+                )
+            )
     except KeyboardInterrupt:
         logging.info("Bot stopped")
 
