@@ -1,5 +1,6 @@
 import unittest
 from io import BytesIO
+from unittest.mock import patch
 
 from PIL import Image
 from quote_bot.bot import (
@@ -7,6 +8,7 @@ from quote_bot.bot import (
     _build_webhook_url,
     _build_inline_photo_result,
     _contains_emoji,
+    _load_font,
     _normalize_run_mode,
     _normalize_webhook_public_base_url,
     _normalize_webhook_path,
@@ -73,6 +75,13 @@ class BotTestCase(unittest.TestCase):
     def test_contains_emoji(self) -> None:
         self.assertTrue(_contains_emoji("hello 😀"))
         self.assertFalse(_contains_emoji("hello"))
+
+    def test_load_font_fallback_honors_size(self) -> None:
+        with patch("quote_bot.bot.os.getenv", return_value=None), patch(
+            "quote_bot.bot.os.path.isfile", return_value=False
+        ):
+            font = _load_font(24)
+        self.assertEqual(getattr(font, "size", None), 24)
 
     def test_render_text_to_png_limits_aspect_ratio(self) -> None:
         text = "x" * 500

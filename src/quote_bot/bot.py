@@ -39,7 +39,7 @@ DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_WEBHOOK_PATH = "/telegram/webhook"
 DEFAULT_FONT_SIZE = 44
-MIN_FONT_SIZE = 28
+MIN_FONT_SIZE = 32
 PADDING = 40
 LINE_SPACING = 10
 MAX_WIDTH_TO_HEIGHT_RATIO = 2.5
@@ -70,7 +70,12 @@ def _load_font(size: int) -> ImageFont.ImageFont:
         except OSError:
             logging.warning("Cannot load font: %s", font_path)
 
-    return ImageFont.load_default()
+    try:
+        # Pillow 10+ supports sizing the built-in fallback font.
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        # Backward compatibility with older Pillow versions.
+        return ImageFont.load_default()
 
 
 def _contains_emoji(text: str) -> bool:
