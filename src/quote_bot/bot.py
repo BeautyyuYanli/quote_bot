@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import hashlib
 import io
 import json
 import logging
 import os
 import secrets
+import threading
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass, field
 from typing import Any, Sequence
@@ -38,6 +40,7 @@ DEFAULT_WORKER_CONCURRENCY = 4
 DEFAULT_BIND_HOST = "0.0.0.0"
 DEFAULT_PORT = 8080
 DEFAULT_WEBHOOK_PATH = "/telegram/webhook"
+EMOJI_HTTP_CACHE_MAX_ITEMS = 1024
 DEFAULT_FONT_SIZE = 44
 MIN_FONT_SIZE = 32
 PADDING = 40
@@ -55,7 +58,33 @@ DEFAULT_FONT_PATHS = (
 )
 
 
-def _load_font(size: int) -> ImageFont.ImageFont:
+if GoogleEmojiSource is not None:
+    class _CachedGoogleEmojiSource(GoogleEmojiSource):
+        _http_cache: dict[str, bytes] = {}
+        _http_cache_lock = threading.Lock()
+
+        def request(self, url: str) -> bytes:
+            with self._http_cache_lock:
+                cached = self._http_cache.get(url)
+                if cached is not None:
+                    return cached
+
+            content = super().request(url)
+
+            with self._http_cache_lock:
+                if url not in self._http_cache:
+                    self._http_cache[url] = content
+                    while len(self._http_cache) > EMOJI_HTTP_CACHE_MAX_ITEMS:
+                        oldest_key = next(iter(self._http_cache))
+                        self._http_cache.pop(oldest_key, None)
+
+            return content
+else:
+    _CachedGoogleEmojiSource = None
+
+
+@functools.lru_cache(maxsize=1)
+def _resolve_font_path() -> str | None:
     font_candidates: list[str] = []
     env_font = os.getenv("QUOTE_BOT_FONT_PATH")
     if env_font:
@@ -63,8 +92,14 @@ def _load_font(size: int) -> ImageFont.ImageFont:
     font_candidates.extend(DEFAULT_FONT_PATHS)
 
     for font_path in font_candidates:
-        if not os.path.isfile(font_path):
-            continue
+        if os.path.isfile(font_path):
+            return font_path
+    return None
+
+
+@functools.lru_cache(maxsize=32)
+def _load_font_from_cache(size: int, font_path: str | None) -> ImageFont.ImageFont:
+    if font_path is not None:
         try:
             return ImageFont.truetype(font_path, size=size)
         except OSError:
@@ -78,6 +113,11 @@ def _load_font(size: int) -> ImageFont.ImageFont:
         return ImageFont.load_default()
 
 
+def _load_font(size: int) -> ImageFont.ImageFont:
+    normalized_size = max(1, int(size))
+    return _load_font_from_cache(normalized_size, _resolve_font_path())
+
+
 def _contains_emoji(text: str) -> bool:
     return emoji.emoji_count(text) > 0
 
@@ -85,7 +125,8 @@ def _contains_emoji(text: str) -> bool:
 def _open_google_pilmoji(image: Image.Image, draw: ImageDraw.ImageDraw) -> Any:
     if Pilmoji is None or GoogleEmojiSource is None:
         return nullcontext(None)
-    return Pilmoji(image, source=GoogleEmojiSource, draw=draw, cache=True)
+    source_cls = _CachedGoogleEmojiSource if _CachedGoogleEmojiSource is not None else GoogleEmojiSource
+    return Pilmoji(image, source=source_cls, draw=draw, cache=True)
 
 
 def _measure_text_width(
@@ -424,7 +465,7 @@ class RuntimeState:
     inline_cache_chat_id: int | None
     inline_debounce_seconds: float
     worker_concurrency: int
-    inline_file_cache: dict[str, str] = field(default_factory=dict)
+    inline_upload_inflight_tasks: dict[str, asyncio.Task[str]] = field(default_factory=dict)
     latest_inline_queries: dict[int, tuple[str, str]] = field(default_factory=dict)
     inline_debounce_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
     inline_processing_tasks: dict[int, asyncio.Task[None]] = field(default_factory=dict)
@@ -449,7 +490,11 @@ def _build_runtime_state(
 
 
 async def _cancel_runtime_tasks(runtime: RuntimeState) -> None:
-    tasks = [*runtime.inline_debounce_tasks.values(), *runtime.inline_processing_tasks.values()]
+    tasks = [
+        *runtime.inline_debounce_tasks.values(),
+        *runtime.inline_processing_tasks.values(),
+        *runtime.inline_upload_inflight_tasks.values(),
+    ]
     for task in tasks:
         if not task.done():
             task.cancel()
@@ -459,6 +504,7 @@ async def _cancel_runtime_tasks(runtime: RuntimeState) -> None:
 
     runtime.inline_debounce_tasks.clear()
     runtime.inline_processing_tasks.clear()
+    runtime.inline_upload_inflight_tasks.clear()
     runtime.latest_inline_queries.clear()
 
 
@@ -522,6 +568,36 @@ def _resolve_upload_chat_candidates(from_user_id: int, inline_cache_chat_id: int
     return candidates
 
 
+async def _render_and_upload_inline_image(
+    *,
+    api: TelegramApi,
+    from_user_id: int,
+    query_text: str,
+    inline_cache_chat_id: int | None,
+) -> str:
+    image_data = await asyncio.to_thread(render_text_to_png, query_text)
+    upload_error: Exception | None = None
+
+    for chat_candidate in _resolve_upload_chat_candidates(
+        from_user_id=from_user_id,
+        inline_cache_chat_id=inline_cache_chat_id,
+    ):
+        try:
+            sent = await api.send_photo(chat_id=chat_candidate, image_data=image_data)
+            return _extract_photo_file_id(sent)
+        except Exception as exc:
+            upload_error = exc
+            logging.warning(
+                "Inline upload failed in chat_id=%s: %s",
+                chat_candidate,
+                exc,
+            )
+
+    if upload_error is not None:
+        raise upload_error
+    raise RuntimeError("Failed to upload inline image")
+
+
 async def _process_text_message(
     api: TelegramApi,
     chat_id: int,
@@ -543,7 +619,7 @@ async def _process_inline_query(
     inline_query_id: str,
     from_user_id: int,
     query_text: str,
-    inline_file_cache: dict[str, str],
+    inline_upload_inflight_tasks: dict[str, asyncio.Task[str]],
     inline_cache_time: int,
     inline_cache_chat_id: int | None,
     processing_semaphore: asyncio.Semaphore,
@@ -560,31 +636,25 @@ async def _process_inline_query(
             return
 
         async with processing_semaphore:
-            file_id = inline_file_cache.get(query_text)
-            if not file_id:
-                image_data = await asyncio.to_thread(render_text_to_png, query_text)
-                upload_error: Exception | None = None
-                for chat_candidate in _resolve_upload_chat_candidates(
-                    from_user_id=from_user_id,
-                    inline_cache_chat_id=inline_cache_chat_id,
-                ):
-                    try:
-                        sent = await api.send_photo(chat_id=chat_candidate, image_data=image_data)
-                        file_id = _extract_photo_file_id(sent)
-                        inline_file_cache[query_text] = file_id
-                        break
-                    except Exception as exc:
-                        upload_error = exc
-                        logging.warning(
-                            "Inline upload failed in chat_id=%s: %s",
-                            chat_candidate,
-                            exc,
-                        )
+            upload_task = inline_upload_inflight_tasks.get(query_text)
+            if upload_task is None or upload_task.done():
+                upload_task = asyncio.create_task(
+                    _render_and_upload_inline_image(
+                        api=api,
+                        from_user_id=from_user_id,
+                        query_text=query_text,
+                        inline_cache_chat_id=inline_cache_chat_id,
+                    )
+                )
+                inline_upload_inflight_tasks[query_text] = upload_task
 
-                if not file_id:
-                    if upload_error is not None:
-                        raise upload_error
-                    raise RuntimeError("Failed to upload inline image")
+                def _cleanup(done_task: asyncio.Task[str], *, text: str = query_text) -> None:
+                    if inline_upload_inflight_tasks.get(text) is done_task:
+                        inline_upload_inflight_tasks.pop(text, None)
+
+                upload_task.add_done_callback(_cleanup)
+
+            file_id = await asyncio.shield(upload_task)
 
             await api.answer_inline_query(
                 inline_query_id=inline_query_id,
@@ -615,7 +685,7 @@ async def _debounced_inline_dispatch(
     inline_debounce_tasks: dict[int, asyncio.Task[None]],
     inline_processing_tasks: dict[int, asyncio.Task[None]],
     api: TelegramApi,
-    inline_file_cache: dict[str, str],
+    inline_upload_inflight_tasks: dict[str, asyncio.Task[str]],
     inline_cache_time: int,
     inline_cache_chat_id: int | None,
     processing_semaphore: asyncio.Semaphore,
@@ -633,7 +703,7 @@ async def _debounced_inline_dispatch(
                 inline_query_id=inline_query_id,
                 from_user_id=from_user_id,
                 query_text=query_text,
-                inline_file_cache=inline_file_cache,
+                inline_upload_inflight_tasks=inline_upload_inflight_tasks,
                 inline_cache_time=inline_cache_time,
                 inline_cache_chat_id=inline_cache_chat_id,
                 processing_semaphore=processing_semaphore,
@@ -669,7 +739,7 @@ def _schedule_inline_query(
     inline_debounce_tasks: dict[int, asyncio.Task[None]],
     inline_processing_tasks: dict[int, asyncio.Task[None]],
     api: TelegramApi,
-    inline_file_cache: dict[str, str],
+    inline_upload_inflight_tasks: dict[str, asyncio.Task[str]],
     inline_cache_time: int,
     inline_cache_chat_id: int | None,
     processing_semaphore: asyncio.Semaphore,
@@ -692,7 +762,7 @@ def _schedule_inline_query(
             inline_debounce_tasks=inline_debounce_tasks,
             inline_processing_tasks=inline_processing_tasks,
             api=api,
-            inline_file_cache=inline_file_cache,
+            inline_upload_inflight_tasks=inline_upload_inflight_tasks,
             inline_cache_time=inline_cache_time,
             inline_cache_chat_id=inline_cache_chat_id,
             processing_semaphore=processing_semaphore,
@@ -736,7 +806,7 @@ async def _dispatch_update(
             inline_debounce_tasks=runtime.inline_debounce_tasks,
             inline_processing_tasks=runtime.inline_processing_tasks,
             api=api,
-            inline_file_cache=runtime.inline_file_cache,
+            inline_upload_inflight_tasks=runtime.inline_upload_inflight_tasks,
             inline_cache_time=runtime.inline_cache_time,
             inline_cache_chat_id=runtime.inline_cache_chat_id,
             processing_semaphore=runtime.processing_semaphore,

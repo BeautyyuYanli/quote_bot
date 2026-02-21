@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from io import BytesIO
 from unittest.mock import patch
@@ -12,6 +13,7 @@ from quote_bot.bot import (
     _normalize_run_mode,
     _normalize_webhook_public_base_url,
     _normalize_webhook_path,
+    _process_inline_query,
     extract_inline_query,
     extract_text_message,
     render_text_to_png,
@@ -118,6 +120,84 @@ class BotTestCase(unittest.TestCase):
         self.assertEqual(_build_webhook_health_path("/telegram/webhook"), "/telegram/webhook/healthz")
         self.assertEqual(_build_webhook_health_path("telegram/webhook/"), "/telegram/webhook/healthz")
         self.assertEqual(_build_webhook_health_path("/"), "/healthz")
+
+
+class InlineProcessTestCase(unittest.IsolatedAsyncioTestCase):
+    class _FakeApi:
+        def __init__(self) -> None:
+            self.send_photo_calls = 0
+            self.answer_calls = 0
+
+        async def send_photo(self, chat_id: int, image_data: bytes) -> dict:
+            self.send_photo_calls += 1
+            await asyncio.sleep(0.03)
+            return {"photo": [{"file_id": "f-small"}, {"file_id": "f-large"}]}
+
+        async def answer_inline_query(
+            self,
+            inline_query_id: str,
+            results: list[dict],
+            cache_time: int,
+            is_personal: bool = True,
+        ) -> None:
+            self.answer_calls += 1
+
+    async def test_inline_upload_inflight_deduplicates_concurrent_same_text(self) -> None:
+        api = self._FakeApi()
+        inflight: dict[str, asyncio.Task[str]] = {}
+        sem = asyncio.Semaphore(10)
+        with patch("quote_bot.bot.render_text_to_png", return_value=b"png-bytes"):
+            await asyncio.gather(
+                _process_inline_query(
+                    api=api,  # type: ignore[arg-type]
+                    inline_query_id="q1",
+                    from_user_id=100,
+                    query_text="same text",
+                    inline_upload_inflight_tasks=inflight,
+                    inline_cache_time=60,
+                    inline_cache_chat_id=None,
+                    processing_semaphore=sem,
+                ),
+                _process_inline_query(
+                    api=api,  # type: ignore[arg-type]
+                    inline_query_id="q2",
+                    from_user_id=101,
+                    query_text="same text",
+                    inline_upload_inflight_tasks=inflight,
+                    inline_cache_time=60,
+                    inline_cache_chat_id=None,
+                    processing_semaphore=sem,
+                ),
+            )
+        self.assertEqual(api.send_photo_calls, 1)
+        self.assertEqual(api.answer_calls, 2)
+
+    async def test_inline_upload_is_not_persistently_cached_between_requests(self) -> None:
+        api = self._FakeApi()
+        inflight: dict[str, asyncio.Task[str]] = {}
+        sem = asyncio.Semaphore(10)
+        with patch("quote_bot.bot.render_text_to_png", return_value=b"png-bytes"):
+            await _process_inline_query(
+                api=api,  # type: ignore[arg-type]
+                inline_query_id="q1",
+                from_user_id=100,
+                query_text="same text",
+                inline_upload_inflight_tasks=inflight,
+                inline_cache_time=60,
+                inline_cache_chat_id=None,
+                processing_semaphore=sem,
+            )
+            await _process_inline_query(
+                api=api,  # type: ignore[arg-type]
+                inline_query_id="q2",
+                from_user_id=100,
+                query_text="same text",
+                inline_upload_inflight_tasks=inflight,
+                inline_cache_time=60,
+                inline_cache_chat_id=None,
+                processing_semaphore=sem,
+            )
+        self.assertEqual(api.send_photo_calls, 2)
 
 
 if __name__ == "__main__":
